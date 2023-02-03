@@ -153,6 +153,9 @@
 # amount of substance
   mol: Mole
   
+# amperage
+  A: Ampere
+  
   
   ----
 
