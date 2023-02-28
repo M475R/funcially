@@ -6,12 +6,15 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use eframe::{CreationContext, Frame, Storage};
 use eframe::egui;
-use eframe::egui::text_edit::CursorRange;
+use eframe::egui::panel::PanelState;
+use eframe::egui::text::CCursorRange;
+use eframe::egui::text_edit::{CursorRange, TextEditState};
 use eframe::epaint::Shadow;
 use eframe::epaint::text::cursor::Cursor;
 use egui::*;
@@ -33,6 +36,9 @@ const TEXT_EDIT_MARGIN: Vec2 = Vec2::new(4.0, 2.0);
 const ERROR_COLOR: Color = Color::RED;
 
 const INPUT_TEXT_EDIT_ID: &str = "input-text-edit";
+const PLOT_PANEL_ID: &str = "plot_panel";
+const OUTPUT_PANEL_ID: &str = "output_panel";
+const OUTPUT_PANEL_SCROLL_AREA_ID: &str = "output_panel_scroll_area";
 
 const TOGGLE_COMMENTATION_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::ALT), Key::N);
 const SURROUND_WITH_BRACKETS_SHORTCUT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::B);
@@ -179,9 +185,9 @@ struct App<'a> {
     #[serde(skip)]
     input_text_cursor_range: CursorRange,
     #[serde(skip)]
-    bottom_text: String,
+    should_scroll_to_input_text_cursor: bool,
     #[serde(skip)]
-    cached_help_window_color_segments: Vec<Vec<ColorSegment>>,
+    bottom_text: String,
 }
 
 impl Default for App<'_> {
@@ -206,8 +212,8 @@ impl Default for App<'_> {
             debug_information: None,
             use_thousands_separator: false,
             input_text_cursor_range: CursorRange::one(Cursor::default()),
+            should_scroll_to_input_text_cursor: false,
             bottom_text: format!("v{VERSION}"),
-            cached_help_window_color_segments: Vec::new(),
         }
     }
 }
@@ -242,14 +248,14 @@ impl App<'_> {
             response.sort_by(|first, second| {
                 match version_compare::compare(&first.name, &second.name) {
                     Ok(cmp) => match cmp {
-                        version_compare::Cmp::Lt => std::cmp::Ordering::Less,
-                        version_compare::Cmp::Eq => std::cmp::Ordering::Equal,
-                        version_compare::Cmp::Gt => std::cmp::Ordering::Greater,
+                        version_compare::Cmp::Lt => Ordering::Less,
+                        version_compare::Cmp::Eq => Ordering::Equal,
+                        version_compare::Cmp::Gt => Ordering::Greater,
                         _ => unreachable!(),
                     }
                     Err(_) => {
                         eprintln!("Failed to compare versions {} and {}", first.name, second.name);
-                        std::cmp::Ordering::Equal
+                        Ordering::Equal
                     }
                 }
             });
@@ -289,7 +295,9 @@ impl App<'_> {
             }
             Err(e) => {
                 is_error = true;
-                color_segments.push(ColorSegment::new(e.start..e.end, ERROR_COLOR));
+                for range in e.ranges {
+                    color_segments.push(ColorSegment::new(range, ERROR_COLOR));
+                }
                 format!("{}", e.error)
             }
         };
@@ -308,10 +316,17 @@ impl App<'_> {
         for (i, line) in self.source.lines().enumerate() {
             if i != input_text_paragraph { continue; }
 
-            self.debug_information = match self.calculator.get_debug_info(line, Verbosity::Ast) {
-                Ok(info) => Some(info),
-                Err(e) => Some(format!("Error generating debug information: {}, {}..{}", e.error, e.start, e.end))
-            };
+            if line.trim().starts_with('#') || line.is_empty() {
+                break;
+            }
+
+            let mut line = line;
+            if let Some(comment_start) = line.find('#') {
+                line = &line[0..comment_start];
+            }
+
+            let debug_information = self.calculator.get_debug_info(line, Verbosity::Ast);
+            self.debug_information = Some(debug_information);
             break;
         }
     }
@@ -419,10 +434,17 @@ impl App<'_> {
         }
     }
 
+    fn set_input_text_edit_ccursor_range(&self, ctx: &Context, range: CCursorRange) {
+        if let Some(mut state) = TextEditState::load(ctx, Id::new(INPUT_TEXT_EDIT_ID)) {
+            state.set_ccursor_range(Some(range));
+            state.store(ctx, Id::new(INPUT_TEXT_EDIT_ID));
+        }
+    }
+
     fn plot_panel(&mut self, ctx: &Context) {
         if FullScreenPlot::is_fullscreen(ctx) { return; }
 
-        SidePanel::right("plot_panel")
+        SidePanel::right(PLOT_PANEL_ID)
             .resizable(self.is_ui_enabled)
             .show(ctx, |ui| {
                 ui.set_enabled(self.is_ui_enabled);
@@ -443,15 +465,12 @@ impl App<'_> {
 
     fn help_window(&mut self, ctx: &Context) {
         let is_help_open = &mut self.is_help_open;
-        let color_segments = &mut self.cached_help_window_color_segments;
         Window::new("Help")
             .open(is_help_open)
             .vscroll(true)
             .hscroll(true)
             .enabled(self.is_ui_enabled)
-            .show(ctx, |ui| {
-                build_help(ui, FONT_ID, color_segments);
-            });
+            .show(ctx, build_help);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -564,10 +583,10 @@ impl App<'_> {
     /// Handles shortcuts that modify what's inside the textedit => needs a cursor range
     fn handle_text_edit_shortcuts(&mut self, ui: &mut Ui, cursor_range: CursorRange) {
         if ui.input_mut().consume_shortcut(&TOGGLE_COMMENTATION_SHORTCUT) {
-            self.toggle_commentation(cursor_range);
+            self.toggle_commentation(ui.ctx(), cursor_range);
         }
         if ui.input_mut().consume_shortcut(&SURROUND_WITH_BRACKETS_SHORTCUT) {
-            self.surround_selection_with_brackets(cursor_range);
+            self.surround_selection_with_brackets(ui.ctx(), cursor_range);
         }
         if ui.input_mut().consume_shortcut(&COPY_RESULT_SHORTCUT) {
             self.copy_result(ui, cursor_range);
@@ -587,9 +606,27 @@ impl App<'_> {
         }
     }
 
-    fn toggle_commentation(&mut self, cursor_range: CursorRange) {
-        let start_line = cursor_range.primary.pcursor.paragraph;
-        let end_line = cursor_range.secondary.pcursor.paragraph;
+    fn toggle_commentation(&mut self, ctx: &Context, cursor_range: CursorRange) {
+        let primary_paragraph = cursor_range.primary.pcursor.paragraph;
+        let secondary_paragraph = cursor_range.secondary.pcursor.paragraph;
+        let start_line = primary_paragraph.min(secondary_paragraph);
+        let end_line = primary_paragraph.max(secondary_paragraph);
+
+        let mut ccursor_range = cursor_range.as_ccursor_range();
+
+        fn mut_start_index(range: &mut CCursorRange) -> &mut usize {
+            [&mut range.primary.index, &mut range.secondary.index]
+                .into_iter()
+                .min()
+                .unwrap()
+        }
+
+        fn mut_end_index(range: &mut CCursorRange) -> &mut usize {
+            [&mut range.primary.index, &mut range.secondary.index]
+                .into_iter()
+                .max()
+                .unwrap()
+        }
 
         let has_uncommented_line = self.source.lines()
             .skip(start_line)
@@ -601,6 +638,7 @@ impl App<'_> {
         // uncommented lines too.
         // Otherwise, we uncomment, since all lines are commented.
 
+        let mut char_diff = 0i32;
         let mut new_source = String::new();
         let line_count = self.source.lines().count();
         for (i, line) in self.source.lines().enumerate() {
@@ -620,8 +658,13 @@ impl App<'_> {
                 if !line.trim_start().starts_with('#') {
                     for _ in 0..offset { new_source.push(' '); }
                     new_source.push('#');
+                    char_diff += 1;
                     new_source += &line[offset..];
                     if i != line_count - 1 { new_source.push('\n'); }
+
+                    if i == start_line {
+                        *mut_start_index(&mut ccursor_range) += 1;
+                    }
                 } else {
                     new_source += line;
                     if i != line_count - 1 { new_source.push('\n'); }
@@ -631,17 +674,33 @@ impl App<'_> {
                 new_source += line.chars()
                     .skip(offset + 1)
                     .collect::<String>().as_str();
+                char_diff -= 1;
                 if i != line_count - 1 { new_source.push('\n'); }
+
+                if i == start_line {
+                    *mut_start_index(&mut ccursor_range) -= 1;
+                }
             }
         }
 
         self.source = new_source;
+
+        let end_index = mut_end_index(&mut ccursor_range);
+        match char_diff.cmp(&0) {
+            Ordering::Greater => *end_index += char_diff as usize,
+            Ordering::Less => *end_index -= (-char_diff) as usize,
+            _ => {}
+        }
+
+        self.set_input_text_edit_ccursor_range(ctx, ccursor_range);
     }
 
-    fn surround_selection_with_brackets(&mut self, cursor_range: CursorRange) {
+    fn surround_selection_with_brackets(&mut self, ctx: &Context, cursor_range: CursorRange) {
         // Check that we have a range spanning only one line
         let primary = &cursor_range.primary.pcursor;
         let secondary = &cursor_range.secondary.pcursor;
+
+        let mut ccursor_range = cursor_range.as_ccursor_range();
 
         if (*primary == *secondary) || (primary.paragraph != secondary.paragraph) {
             return;
@@ -668,7 +727,11 @@ impl App<'_> {
             }
         }
 
+        ccursor_range.primary.index += 1;
+        ccursor_range.secondary.index += 1;
+
         self.source = new_source;
+        self.set_input_text_edit_ccursor_range(ctx, ccursor_range);
     }
 
     fn copy_result(&mut self, ui: &mut Ui, cursor_range: CursorRange) {
@@ -705,9 +768,13 @@ impl App<'_> {
             &self.source,
         ).show(ctx);
 
-        if result {
+        if let Some(cursor_changed) = result {
             self.is_ui_enabled = true;
             self.input_should_request_focus = true;
+
+            if cursor_changed {
+                self.should_scroll_to_input_text_cursor = true;
+            }
         }
     }
 
@@ -811,9 +878,6 @@ impl eframe::App for App<'_> {
             self.new_version_dialog(ctx);
         }
 
-        if !self.cached_help_window_color_segments.is_empty() && !self.is_help_open {
-            self.cached_help_window_color_segments.clear();
-        }
         if !self.is_debug_info_open { self.debug_information = None; }
 
         FullScreenPlot::new(
@@ -833,6 +897,20 @@ impl eframe::App for App<'_> {
                         ui.close_menu();
                     }
 
+                    if ui.button("Collapse side panels").clicked() {
+                        fn collapse_panel_state(ctx: &Context, id: impl Into<Id>) {
+                            let id = id.into();
+                            if let Some(mut state) = PanelState::load(ctx, id) {
+                                state.rect.set_width(5.0);
+                                ctx.data().insert_persisted(id, state);
+                            }
+                        }
+
+                        collapse_panel_state(ctx, OUTPUT_PANEL_ID);
+                        collapse_panel_state(ctx, PLOT_PANEL_ID);
+                        self.is_plot_open = false;
+                    }
+
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         ui.separator();
@@ -845,13 +923,13 @@ impl eframe::App for App<'_> {
                 ui.menu_button("Edit", |ui| {
                     let shortcut = ui.ctx().format_shortcut(&SURROUND_WITH_BRACKETS_SHORTCUT);
                     if shortcut_button(ui, "Surround selection with brackets", &shortcut).clicked() {
-                        self.surround_selection_with_brackets(self.input_text_cursor_range);
+                        self.surround_selection_with_brackets(ctx, self.input_text_cursor_range);
                         ui.close_menu();
                     }
 
                     let shortcut = ui.ctx().format_shortcut(&TOGGLE_COMMENTATION_SHORTCUT);
                     if shortcut_button(ui, "(Un)Comment selected lines", &shortcut).clicked() {
-                        self.toggle_commentation(self.input_text_cursor_range);
+                        self.toggle_commentation(ctx, self.input_text_cursor_range);
                         ui.close_menu();
                     }
 
@@ -888,6 +966,7 @@ impl eframe::App for App<'_> {
                     if ui.button("Print Debug Information for current line").clicked() {
                         self.get_debug_info_for_current_line();
                         self.is_debug_info_open = true;
+                        ui.close_menu();
                     }
                 });
 
@@ -936,13 +1015,87 @@ impl eframe::App for App<'_> {
         if self.is_settings_open { self.settings_window(ctx); }
         if self.is_debug_info_open { self.show_debug_information(ctx); }
 
+        let mut output_scroll_area_id: Option<Id> = None;
+
+        if !self.lines.is_empty() {
+            #[cfg(not(target_arch = "wasm32"))]
+                let default_width = _frame.info().window_info.size.x * (1.0 / 3.0);
+            #[cfg(target_arch = "wasm32")]
+                let default_width = 40.0;
+
+            SidePanel::right(OUTPUT_PANEL_ID)
+                .default_width(default_width)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    let mut style = (**ui.style()).clone();
+                    style.visuals.extreme_bg_color = Color32::TRANSPARENT;
+                    style.visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+                    ui.set_style(style);
+
+                    let response = ScrollArea::vertical()
+                        .id_source(OUTPUT_PANEL_SCROLL_AREA_ID)
+                        .enable_scrolling(false)
+                        .show(ui, |ui| {
+                            ui.reset_style();
+                            let mut line_index = 1usize;
+                            for line in &mut self.lines {
+                                if let Line::Line {
+                                    output_text: text,
+                                    function,
+                                    is_error,
+                                    show_in_plot,
+                                    ..
+                                } = line {
+                                    if !*is_error {
+                                        if let Some(Function(_, arg_count, _)) = function {
+                                            if *arg_count == 1 {
+                                                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                                                    let mut show_ui = |ui: &mut Ui| {
+                                                        ui.checkbox(show_in_plot, "Plot");
+                                                    };
+
+                                                    if ui.available_width() < 30.0 {
+                                                        ui.menu_button("☰", show_ui);
+                                                    } else {
+                                                        show_ui(ui);
+                                                    }
+                                                });
+
+                                                ui.add_space(-6.5);
+
+                                                if matches!(line, Line::Line { .. } | Line::Empty) {
+                                                    line_index += 1;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    output_text(ui, text, FONT_ID, line_index);
+                                } else {
+                                    ui.add_space(FONT_SIZE + 2.0);
+                                }
+
+                                if matches!(line, Line::Line { .. } | Line::Empty) {
+                                    line_index += 1;
+                                }
+                            }
+                        });
+
+                    output_scroll_area_id = Some(response.id);
+                    ui.reset_style();
+                });
+        }
+
         CentralPanel::default().show(ctx, |ui| {
             ui.set_enabled(self.is_ui_enabled);
 
             // FIXME: Scroll bar is too long (potential issue in egui?)
             let rows = ((ui.available_height() - TEXT_EDIT_MARGIN.y) / FONT_SIZE) as usize;
 
-            ScrollArea::vertical().show(ui, |ui| {
+            let response = ScrollArea::vertical().show(ui, |ui| {
                 ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
                     let char_width = ui.fonts().glyph_width(&FONT_ID, '0') + 2.0;
 
@@ -960,7 +1113,48 @@ impl eframe::App for App<'_> {
                         .margin(vec2(0.0, 2.0))
                         .show(ui);
 
-                    let input_width = ui.available_width() * (2.0 / 3.0);
+                    if let Some(mut input_state) = TextEditState::load(ctx, Id::new(INPUT_TEXT_EDIT_ID)) {
+                        if let Some(mut cursor_range) = input_state.ccursor_range() {
+                            let mut i = 0usize;
+                            let events = &mut ui.input_mut().events;
+
+                            const BRACKETS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+                            while i < events.len() {
+                                if let Event::Text(text) = &events[i] {
+                                    let mut remove = false;
+                                    for (_, c) in BRACKETS {
+                                        if *text == String::from(c) &&
+                                            self.source.chars().nth(cursor_range.primary.index)
+                                                .map(|char| char == c)
+                                                .unwrap_or_default() {
+                                            cursor_range.primary.index += 1;
+                                            cursor_range.secondary.index += 1;
+                                            input_state.set_ccursor_range(Some(cursor_range));
+                                            remove = true;
+                                        }
+                                    }
+                                    if remove {
+                                        events.remove(i);
+                                        continue;
+                                    }
+                                } else if let Event::Key { key: Key::Backspace, pressed: true, modifiers } = &events[i] {
+                                    if modifiers.is_none() {
+                                        for (opening, closing) in BRACKETS {
+                                            if self.source.chars().nth(cursor_range.primary.index) == Some(closing) &&
+                                                self.source.chars().nth(cursor_range.primary.index - 1) == Some(opening) {
+                                                self.source.remove(cursor_range.primary.index);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                i += 1;
+                            }
+                        }
+
+                        input_state.store(ctx, Id::new(INPUT_TEXT_EDIT_ID));
+                    }
 
                     let lines = &mut self.lines;
                     let output = TextEdit::multiline(&mut self.source)
@@ -968,7 +1162,7 @@ impl eframe::App for App<'_> {
                         .lock_focus(true)
                         .hint_text("Calculate something")
                         .frame(false)
-                        .desired_width(input_width)
+                        .desired_width(ui.available_width())
                         .font(FontSelection::from(FONT_ID))
                         .desired_rows(rows)
                         .layouter(&mut input_layouter(
@@ -977,8 +1171,32 @@ impl eframe::App for App<'_> {
                             self.search_state.selected_range_if_open(),
                         ))
                         .show(ui);
+
+                    self.update_lines(output.galley.clone());
+
                     if let Some(range) = output.cursor_range {
                         self.input_text_cursor_range = range;
+
+                        for event in &ui.input().events {
+                            if let Event::Text(text) = event {
+                                if let Some(c) = match text.as_str() {
+                                    "(" => Some(')'),
+                                    "{" => Some('}'),
+                                    "[" => Some(']'),
+                                    _ => None,
+                                } {
+                                    self.source.insert(range.primary.ccursor.index, c);
+                                }
+                            }
+                        }
+
+                        if self.should_scroll_to_input_text_cursor {
+                            let cursor_pos = output.galley
+                                .pos_from_cursor(&range.primary)
+                                .translate(output.response.rect.min.to_vec2());
+                            ui.scroll_to_rect(cursor_pos, None);
+                            self.should_scroll_to_input_text_cursor = false;
+                        }
                     }
 
                     if self.input_should_request_focus {
@@ -986,64 +1204,19 @@ impl eframe::App for App<'_> {
                         output.response.request_focus();
                     }
 
-                    self.update_lines(output.galley);
-
                     if let Some(range) = output.cursor_range {
                         self.handle_text_edit_shortcuts(ui, range);
                     }
                     self.handle_shortcuts(ui);
-
-                    Separator::default().vertical().ui(ui);
-
-                    ui.vertical(|ui| {
-                        ui.add_space(2.0);
-                        ui.spacing_mut().item_spacing.y = 0.0;
-
-                        // Spacer to put scroll wheel at the right side of the window
-                        ui.allocate_exact_size(
-                            vec2(ui.available_width(), 0.0), Sense::hover());
-
-                        let mut line_index = 1usize;
-                        for line in &mut self.lines {
-                            if let Line::Line {
-                                output_text: text,
-                                function,
-                                is_error,
-                                show_in_plot,
-                                ..
-                            } = line {
-                                if !*is_error {
-                                    if let Some(Function(_, arg_count, _)) = function {
-                                        if *arg_count == 1 {
-                                            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                                                let mut show_ui = |ui: &mut Ui| {
-                                                    ui.checkbox(show_in_plot, "Plot");
-                                                };
-
-                                                if ui.available_width() < 30.0 {
-                                                    ui.menu_button("☰", show_ui);
-                                                } else {
-                                                    show_ui(ui);
-                                                }
-                                                ui.add_space(-2.0);
-                                            });
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                output_text(ui, text, FONT_ID, line_index);
-                            } else {
-                                ui.add_space(FONT_SIZE + 2.0);
-                            }
-
-                            if matches!(line, Line::Line { .. } | Line::Empty) {
-                                line_index += 1;
-                            }
-                        }
-                    });
                 });
             });
+
+            if let Some(id) = output_scroll_area_id {
+                if let Some(mut output_scroll_state) = scroll_area::State::load(ctx, id) {
+                    output_scroll_state.offset = response.state.offset;
+                    output_scroll_state.store(ctx, id);
+                }
+            }
         });
 
         self.first_frame = false;

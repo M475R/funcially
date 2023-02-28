@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use crate::{common::{ErrorType, Result}, environment::currencies::{Currencies, is_currency}, environment::unit_conversion::{convert_units, format_unit, UNITS}, error};
@@ -13,22 +12,22 @@ use crate::{common::{ErrorType, Result}, environment::currencies::{Currencies, i
 pub enum Unit {
     Product(Vec<Unit>),
     Fraction(Box<Unit>, Box<Unit>),
-    Unit(String, f64),
+    Unit(String, f64, Range<usize>),
 }
 
 impl Unit {
-    pub fn new(str: &str, power: f64) -> Unit { Unit::Unit(str.to_string(), power) }
-
-    pub fn new_fraction(numerator: &str, denominator: &str) -> Unit {
-        Unit::Fraction(
-            Box::new(Unit::new(numerator, 1.0)),
-            Box::new(Unit::new(denominator, 1.0)),
-        )
-    }
+    pub fn new(str: &str, power: f64, range: Range<usize>) -> Unit { Unit::Unit(str.to_string(), power, range) }
 
     pub fn push_unit(&mut self, other: Unit) {
         match self {
-            ref unit @ Self::Unit(..) => *self = Unit::Product(vec![(*unit).clone(), other]),
+            Self::Unit(..) => {
+                if let Self::Fraction(mut other_num, other_denom, ..) = other {
+                    other_num.push_unit(self.clone());
+                    *self = Unit::Fraction(other_num, other_denom);
+                } else {
+                    *self = Unit::Product(vec![self.clone(), other]);
+                }
+            }
             Self::Product(units) => units.push(other),
             Self::Fraction(num, denom) => {
                 if let Self::Fraction(other_num, other_denom) = other {
@@ -56,8 +55,8 @@ impl Unit {
                 }
 
                 fn can_be_shortened(first: &Unit, second: &Unit) -> bool {
-                    if let Unit::Unit(first_unit, _) = first {
-                        if let Unit::Unit(second_unit, _) = second {
+                    if let Unit::Unit(first_unit, ..) = first {
+                        if let Unit::Unit(second_unit, ..) = second {
                             return first_unit == second_unit;
                         }
                     }
@@ -93,8 +92,8 @@ impl Unit {
 
                             if let Some(denom_i) = denom_units.iter().position(|denom_unit| can_be_shortened(denom_unit, &num_units[i])) {
                                 'inner: {
-                                    if let Unit::Unit(_, denom_power) = &mut denom_units[denom_i] {
-                                        if let Unit::Unit(_, num_power) = &mut num_units[i] {
+                                    if let Unit::Unit(_, denom_power, _) = &mut denom_units[denom_i] {
+                                        if let Unit::Unit(_, num_power, _) = &mut num_units[i] {
                                             let (break_, remove_num, remove_denom) = shorten_powers(num_power, denom_power);
                                             if remove_num { num_units.remove(i); }
                                             if remove_denom { denom_units.remove(denom_i); }
@@ -131,8 +130,8 @@ impl Unit {
                         if let Some(i) = num_units.iter().position(|u| can_be_shortened(u, denom)) {
                             let mut did_remove_denom = false;
                             'inner: {
-                                if let Unit::Unit(_, denom_power) = &mut **denom {
-                                    if let Unit::Unit(_, num_power) = &mut num_units[i] {
+                                if let Unit::Unit(_, denom_power, _) = &mut **denom {
+                                    if let Unit::Unit(_, num_power, _) = &mut num_units[i] {
                                         let (break_, remove_num, remove_denom) = shorten_powers(num_power, denom_power);
                                         if remove_num { num_units.remove(i); }
                                         if remove_denom { did_remove_denom = true; }
@@ -157,23 +156,45 @@ impl Unit {
                             }
                         }
                     }
-                    (num @ Self::Unit(..), denom @ Self::Unit(..)) => {
-                        if num == denom { return false; }
+                    (Self::Unit(num_str, num_pow, num_range),
+                        Self::Unit(denom_str, denom_pow, ..)) => {
+                        if num_str == denom_str {
+                            if num_pow == denom_pow {
+                                return false;
+                            } else if denom_pow < num_pow {
+                                *num_pow -= *denom_pow;
+                                *self = Self::Unit(num_str.clone(), *num_pow, num_range.clone());
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
             Self::Product(units) => {
-                let mut unique_units = HashMap::<&str, f64>::new();
-                for unit in units.iter().filter(|unit| matches!(unit, Unit::Unit(..))) {
-                    let Unit::Unit(unit, power) = unit else { unreachable!(); };
-                    let count = unique_units.entry(unit).or_insert(0.0);
-                    *count += *power;
-                }
+                // Combine equal units into the unit with a power
+                {
+                    let units_value = std::mem::take(units);
 
-                *units = unique_units.iter()
-                    .map(|(unit, power)| Unit::new(unit, *power))
-                    .collect::<Vec<_>>();
+                    let mut unique_units: Vec<(String, f64, Range<usize>)> = vec![];
+                    let mut remaining_units = vec![];
+                    for unit in units_value {
+                        if let Unit::Unit(unit, power, range) = unit {
+                            if let Some((_, p, _)) = unique_units.iter_mut().find(|(str, ..)| str == &unit) {
+                                *p += power;
+                            } else {
+                                unique_units.push((unit, power, range));
+                            }
+                        } else {
+                            remaining_units.push(unit);
+                        }
+                    }
+
+                    *units = remaining_units.into_iter()
+                        .chain(unique_units.into_iter()
+                            .map(|(unit, power, range)| Unit::Unit(unit, power, range))
+                        )
+                        .collect::<Vec<_>>();
+                }
 
                 let mut i = 0usize;
                 while i < units.len() {
@@ -223,7 +244,7 @@ impl Unit {
                     }
                     result
                 }
-                Self::Unit(str, power) => {
+                Self::Unit(str, power, ..) => {
                     let mut result = str.to_string();
                     if *power != 1.0 { result += &format!("^{power}"); }
                     result
@@ -256,7 +277,7 @@ impl Unit {
                 Self::Fraction(numerator, denominator) => {
                     format!("{} per {}", numerator.format(full_unit, plural), denominator.format(full_unit, false))
                 }
-                Self::Unit(str, power) => format!("{}{}", format_unit(str, plural), format_unit_power(*power)),
+                Self::Unit(str, power, ..) => format!("{}{}", format_unit(str, plural), format_unit_power(*power)),
             }
         }
     }
@@ -275,7 +296,7 @@ fn format_unit_power(pow: f64) -> String {
 }
 
 impl From<&str> for Unit {
-    fn from(value: &str) -> Self { Self::new(value, 1.0) }
+    fn from(value: &str) -> Self { Self::new(value, 1.0, 0..1) }
 }
 
 impl std::fmt::Display for Unit {
@@ -285,19 +306,14 @@ impl std::fmt::Display for Unit {
 }
 
 // Stores prefix with its power (e.g. k => * 10^3)
-pub const PREFIXES: [(char, i32); 19] = [
-    ('y', -24), ('z', -21), ('a', -18), ('f', -15), ('p', -12), ('n', -9), ('m', -3), ('c', -2), ('d', -1),
+pub const PREFIXES: [(char, i32); 14] = [
+    ('n', -9), ('m', -3), ('c', -2), ('d', -1),
     ('\0', 0),
     ('h', 2), ('k', 3), ('M', 6), ('G', 9), ('T', 12), ('P', 15), ('E', 18), ('Z', 21), ('Y', 24),
 ];
 
 pub fn prefix_to_string(prefix: char) -> Option<&'static str> {
     match prefix {
-        'y' => Some("Yocto"),
-        'z' => Some("Zepto"),
-        'a' => Some("Atto"),
-        'f' => Some("Femto"),
-        'p' => Some("Pico"),
         'n' => Some("Nano"),
         'm' => Some("Milli"),
         'c' => Some("Centi"),
@@ -353,9 +369,15 @@ pub fn convert(src_unit: &Unit, dst_unit: &Unit, n: f64, currencies: &Currencies
             let denominator = convert(src_denominator, dst_denominator, 1.0, currencies, range)?;
             Ok(numerator / denominator)
         }
-        Unit::Unit(src, power) => {
-            let Unit::Unit(dst, dst_power) = dst_unit else { error!(UnitsNotMatching: range.clone()); };
-            convert_units((src, *power), (dst, *dst_power), n, currencies, range)
+        Unit::Unit(src, power, range) => {
+            let Unit::Unit(dst, dst_power, dst_range) = dst_unit else { error!(UnitsNotMatching: range.clone()); };
+            convert_units(
+                (src, *power, range.clone()),
+                (dst, *dst_power, dst_range.clone()),
+                n,
+                currencies,
+                range,
+            )
         }
     }
 }

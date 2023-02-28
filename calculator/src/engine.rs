@@ -94,6 +94,15 @@ pub struct NumberValue {
 }
 
 impl NumberValue {
+    pub fn new(number: f64) -> Self {
+        Self {
+            number,
+            unit: None,
+            is_long_unit: false,
+            format: Format::Decimal,
+        }
+    }
+
     pub fn unit_string(&self) -> String {
         self.unit.as_ref()
             .map(|unit| unit.format(self.is_long_unit, self.number != 1.0))
@@ -127,7 +136,7 @@ impl Value {
                 let mut result = number.format.format(number.number, use_thousands_separator);
                 if !matches!(number.unit, Some(Unit::Unit(..))) || number.is_long_unit { result.push(' '); }
                 result + &number.unit_string()
-            },
+            }
             Value::Object(object) => object.to_string(settings),
         }
     }
@@ -165,10 +174,10 @@ pub struct Engine<'a> {
 
 impl<'a> Engine<'a> {
     pub(crate) fn evaluate_to_number(ast: Vec<AstNode>, context: Context) -> Result<NumberValue> {
-        let full_range = full_range(&ast);
+        let _full_range = full_range(&ast);
         let result = Engine::evaluate(ast, context)?;
         let Some(result) = result.to_number() else {
-            return Err(ErrorType::ExpectedNumber.with(full_range));
+            return Err(ErrorType::ExpectedNumber.with(_full_range));
         };
         Ok(result.clone())
     }
@@ -292,6 +301,7 @@ impl<'a> Engine<'a> {
 
                         let mut question_mark_arg_name: Option<&str> = None;
                         let mut question_mark_range: Option<Range<usize>> = None;
+                        let mut question_mark_unit: Option<Unit> = None;
 
                         for (i, arg) in args.iter().enumerate() {
                             if validate_and_get_unit(arg, env, is_surrounded_by_exponentiation, None)?.is_some() {
@@ -300,7 +310,8 @@ impl<'a> Engine<'a> {
                                     return Err(ErrorType::UnexpectedQuestionMark.with(range));
                                 }
 
-                                question_mark_arg_name = Some(&f.0[i]);
+                                question_mark_arg_name = Some(&f.0[i].0);
+                                question_mark_unit = f.0[i].1.clone();
                                 question_mark_range = Some(range);
                             }
                         }
@@ -312,15 +323,15 @@ impl<'a> Engine<'a> {
                                 is_surrounded_by_exponentiation,
                                 question_mark_arg_name,
                             ) {
-                                Ok(val) => if let Some(unit) = val {
+                                Ok(val) => if let Some(unit) = val.or(Some(question_mark_unit)) {
                                     return Ok(Some(unit));
                                 }
                                 Err(mut e) => {
                                     // TODO: Maybe somehow show the corresponding variable
                                     //  reference in the function source in addition to this.
                                     let range = question_mark_range.unwrap();
-                                    e.start = range.start;
-                                    e.end = range.end;
+                                    e.ranges.first_mut().unwrap().start = range.start;
+                                    e.ranges.first_mut().unwrap().end = range.end;
                                     return Err(e);
                                 }
                             }
@@ -457,7 +468,23 @@ impl<'a> Engine<'a> {
                 _ => continue,
             };
 
-            let mut args = Vec::new();
+
+            // TODO: Make this generic!?
+            let mut first_arg: Option<NumberValue> = None;
+            if func_name == "abs" && arg_asts.len() == 1 {
+                match Self::evaluate(arg_asts[0].clone(), self.context)? {
+                    Value::Number(number) => first_arg = Some(number),
+                    Value::Object(CalculatorObject::Vector(vector)) => {
+                        let result = vector.length();
+                        let new_node = AstNode::from(node, AstNodeData::Literal(result));
+                        let _ = replace(node, new_node);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut args = if let Some(arg) = first_arg { vec![arg] } else { vec![] };
             for ast in arg_asts {
                 args.push(Self::evaluate_to_number(ast.clone(), self.context)?);
             }
@@ -470,13 +497,16 @@ impl<'a> Engine<'a> {
                 }
                 Err(ty) => match ty {
                     ErrorType::UnknownFunction(_) => {
-                        let args = args.iter()
-                            .map(|r| r.number)
+                        let args = args.into_iter()
+                            .zip(arg_asts.iter().map(|ast| full_range(ast)))
                             .collect::<Vec<_>>();
-                        match self.context.env.resolve_custom_function(func_name, &args, self.context) {
-                            Ok(res) => res.to_ast_node_from(node),
-                            Err(ty) => return Err(ty.with(node.range.clone())),
-                        }
+                        let res = self.context.env.resolve_custom_function(
+                            func_name,
+                            &args,
+                            node.range.clone(),
+                            self.context,
+                        )?;
+                        res.to_ast_node_from(node)
                     }
                     _ => {
                         return Err(ty.with(node.range.clone()));
@@ -552,13 +582,14 @@ impl<'a> Engine<'a> {
     }
 }
 
-fn full_range(ast: &[AstNode]) -> Range<usize> {
+pub fn full_range(ast: &[AstNode]) -> Range<usize> {
     ast.first().unwrap().range.start..ast.last().unwrap().range.end
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+
     use crate::{Parser, ParserResult, tokenize};
     use crate::astgen::objects::DateObject;
     use crate::common::Result;

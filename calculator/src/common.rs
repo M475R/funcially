@@ -12,11 +12,11 @@ const CRATE_NAME: &str = "funcially";
 
 #[macro_export]
 macro_rules! error {
-    ($ty:ident: $range:expr) => {
-        return Err(ErrorType::$ty.with($range))
+    ($ty:ident: $($range:expr),+) => {
+        return Err(ErrorType::$ty.with_multiple(vec![$($range),+]))
     };
-    ($ty:ident($($arg:expr),+): $range:expr) => {
-        return Err(ErrorType::$ty($($arg),+).with($range))
+    ($ty:ident($($arg:expr),+): $($range:expr),+) => {
+        return Err(ErrorType::$ty($($arg),+).with_multiple(vec![$($range),+]))
     };
 }
 
@@ -128,6 +128,10 @@ pub enum ErrorType {
     ExpectedInteger(f64),
     #[error("Expected percentage for 'of' operator")]
     ExpectedPercentage,
+    #[error("Expected a vector")]
+    ExpectedVector,
+    #[error("The lengths don't match")]
+    VectorLengthsNotMatching,
     #[error("Argument 1 must be less than argument 2")]
     Arg1GreaterThanArg2,
     #[error("Unknown conversion ({0} -> {1})")]
@@ -163,8 +167,14 @@ impl ErrorType {
     pub fn with(self, range: Range<usize>) -> Error {
         Error {
             error: self,
-            start: range.start,
-            end: range.end,
+            ranges: vec![range],
+        }
+    }
+
+    pub fn with_multiple(self, ranges: Vec<Range<usize>>) -> Error {
+        Error {
+            error: self,
+            ranges,
         }
     }
 }
@@ -172,8 +182,7 @@ impl ErrorType {
 #[derive(Debug, Clone)]
 pub struct Error {
     pub error: ErrorType,
-    pub start: usize,
-    pub end: usize,
+    pub ranges: Vec<Range<usize>>,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

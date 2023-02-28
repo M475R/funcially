@@ -23,6 +23,7 @@ pub use environment::{Environment, Function};
 
 use crate::astgen::parser::ParserResult;
 pub use crate::engine::Format;
+pub use crate::engine::NumberValue;
 use crate::engine::Value;
 use crate::environment::units::is_unit_with_prefix;
 pub use crate::settings::*;
@@ -35,22 +36,6 @@ mod color;
 mod settings;
 
 const CRASH_REPORTS_DIR: &str = "crash_reports";
-
-macro_rules! writeln_or_err {
-    ($dst:expr) => {
-        writeln_or_err!($dst, "")
-    };
-    ($dst:expr, $str:expr) => {
-        if writeln!($dst, $str).is_err() {
-            return Ok("Error writing to string".to_string());
-        }
-    };
-    ($dst:expr, $str:expr, $($arg:expr),*) => {
-        if writeln!($dst, $str, $($arg),*).is_err() {
-            return Ok("Error writing to string".to_string());
-        }
-    };
-}
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Verbosity {
@@ -340,7 +325,7 @@ impl<'a> Calculator<'a> {
 
         let tokens = tokenize(line)?;
 
-        let mut is_in_square_brackets = false;
+        let mut is_in_unit = false;
         let mut is_in_object = false;
 
         let mut new_line = String::new();
@@ -392,14 +377,14 @@ impl<'a> Calculator<'a> {
                 }
 
                 if (i != 0 && token.ty.is_literal() && tokens[i - 1].ty == Identifier && !matches!(tokens[i - 1].text.as_str(), "e" | "E")) ||
-                    (token.ty == OpenSquareBracket && tokens[i - 1].ty != ObjectArgs && is_in_object) {
+                    (token.ty == OpenSquareBracket && i != 0 && tokens[i - 1].ty != ObjectArgs && is_in_object) {
                     new_line.push(' ');
                 }
 
-                if token.ty == OpenSquareBracket {
-                    is_in_square_brackets = true;
+                if token.ty == OpenSquareBracket && i != 0 && !tokens[i - 1].ty.is_operator() {
+                    is_in_unit = true;
                 } else if token.ty == CloseSquareBracket {
-                    is_in_square_brackets = false;
+                    is_in_unit = false;
                 }
 
                 if token.ty == OpenCurlyBracket {
@@ -420,11 +405,15 @@ impl<'a> Calculator<'a> {
                         | Comma
                         | DefinitionSign
                         | EqualsSign
+                        | Identifier
                     ) { // Check if we're a sign
-                        if let Some(next) = tokens.get(i + 1) {
-                            if next.ty.is_number() {
-                                new_line += text;
-                                continue;
+                        // Check if we're a sign after the 'e' of scientific notation
+                        if tokens[i - 1].ty != Identifier || (tokens[i - 1].text == "e" || tokens[i - 1].text == "E") {
+                            if let Some(next) = tokens.get(i + 1) {
+                                if next.ty.is_number() {
+                                    new_line += text;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -445,14 +434,14 @@ impl<'a> Calculator<'a> {
 
                 if !(token.ty.is_format() && tokens.get(i.saturating_sub(1))
                     .map_or(false, |t| t.ty == In)) &&
-                    token.ty != Exponentiation && !is_in_square_brackets {
+                    token.ty != Exponentiation && !is_in_unit {
                     new_line.push(' ');
                 }
                 new_line += text;
-                if i != tokens.len() - 1 && token.ty != Exponentiation && !is_in_square_brackets {
+                if i != tokens.len() - 1 && token.ty != Exponentiation && !is_in_unit {
                     new_line.push(' ');
                 }
-            } else if token.ty == Comma {
+            } else if matches!(token.ty, Comma | Semicolon) {
                 new_line += text;
                 if i != tokens.len() - 1 {
                     new_line.push(' ');
@@ -468,48 +457,59 @@ impl<'a> Calculator<'a> {
         Ok(new_line.to_string())
     }
 
-    pub fn get_debug_info(&self, input: &str, verbosity: Verbosity) -> Result<String> {
-        let mut output = String::new();
+    pub fn get_debug_info(&self, input: &str, verbosity: Verbosity) -> String {
+        let mut output = "Line:\n".to_string();
 
-        let tokens = tokenize(input)?;
-        if matches!(verbosity, Verbosity::Tokens | Verbosity::Ast) {
-            writeln_or_err!(&mut output, "Tokens:");
-            for token in &tokens {
-                writeln_or_err!(&mut output, "{} => {:?}", token.text, token.ty);
+        let tokens = match tokenize(input) {
+            Ok(tokens) => tokens,
+            Err(e) => {
+                writeln!(&mut output, "Error while tokenizing: {} at", e.error).unwrap();
+                for range in e.ranges {
+                    writeln!(&mut output, "\t{range:?}").unwrap();
+                }
+
+                return output;
             }
-            writeln_or_err!(&mut output);
+        };
+
+        if matches!(verbosity, Verbosity::Tokens | Verbosity::Ast) {
+            writeln!(&mut output, "Tokens:").unwrap();
+            for token in &tokens {
+                writeln!(&mut output, "{} => {:?}", token.text, token.ty).unwrap();
+            }
+            writeln!(&mut output).unwrap();
         }
 
         if verbosity == Verbosity::Ast {
             match Parser::parse(&tokens, self.context()) {
                 Ok(parser_result) => match parser_result {
                     ParserResult::Calculation(ast) => {
-                        writeln_or_err!(&mut output, "AST:");
-                        for node in &ast { writeln_or_err!(&mut output, "{}", node); }
-                        writeln_or_err!(&mut output);
+                        writeln!(&mut output, "AST:").unwrap();
+                        for node in &ast { writeln!(&mut output, "{}", node).unwrap(); }
+                        writeln!(&mut output).unwrap();
                     }
                     ParserResult::BooleanExpression { lhs, rhs, operator } => {
-                        writeln_or_err!(&mut output, "Boolean expression:\nOperator: {operator:?}\nLHS:");
-                        for node in &lhs { writeln_or_err!(&mut output, "{}", node); }
-                        writeln_or_err!(&mut output, "RHS:");
-                        for node in &rhs { writeln_or_err!(&mut output, "{}", node); }
-                        writeln_or_err!(&mut output);
+                        writeln!(&mut output, "Boolean expression:\nOperator: {operator:?}\nLHS:").unwrap();
+                        for node in &lhs { writeln!(&mut output, "{}", node).unwrap(); }
+                        writeln!(&mut output, "RHS:").unwrap();
+                        for node in &rhs { writeln!(&mut output, "{}", node).unwrap(); }
+                        writeln!(&mut output).unwrap();
                     }
                     ParserResult::VariableDefinition(name, ast) => {
                         if let Some(ast) = ast {
-                            writeln_or_err!(&mut output, "Variable Definition: {}\nAST:", name);
-                            for node in &ast { writeln_or_err!(&mut output, "{}", node); }
+                            writeln!(&mut output, "Variable Definition: {}\nAST:", name).unwrap();
+                            for node in &ast { writeln!(&mut output, "{}", node).unwrap(); }
                         } else {
-                            writeln_or_err!(&mut output, "Variable removal: {}", name);
+                            writeln!(&mut output, "Variable removal: {}", name).unwrap();
                         }
                     }
                     ParserResult::FunctionDefinition { name, args, ast } => {
                         if let Some(ast) = ast {
-                            writeln_or_err!(&mut output, "Function Definition: {}", name);
-                            writeln_or_err!(&mut output, "Arguments: {:?}\nAST:", args);
-                            for node in &ast { writeln_or_err!(&mut output, "{}", node); }
+                            writeln!(&mut output, "Function Definition: {}", name).unwrap();
+                            writeln!(&mut output, "Arguments: {:?}\nAST:", args).unwrap();
+                            for node in &ast { writeln!(&mut output, "{}", node).unwrap(); }
                         } else {
-                            writeln_or_err!(&mut output, "Function removal: {}", name);
+                            writeln!(&mut output, "Function removal: {}", name).unwrap();
                         }
                     }
                     ParserResult::Equation {
@@ -518,21 +518,25 @@ impl<'a> Calculator<'a> {
                         is_question_mark_in_lhs,
                         output_variable
                     } => {
-                        writeln_or_err!(&mut output, "Equation:");
-                        writeln_or_err!(&mut output, "QuestionMark is in {}, output variable: {:?}\nLHS:", if is_question_mark_in_lhs { "LHS" } else { "RHS" }, output_variable);
-                        for node in &lhs { writeln_or_err!(&mut output, "{}", node); }
-                        writeln_or_err!(&mut output, "RHS:");
-                        for node in &rhs { writeln_or_err!(&mut output, "{}", node); }
-                        writeln_or_err!(&mut output);
+                        writeln!(&mut output, "Equation:").unwrap();
+                        writeln!(&mut output, "QuestionMark is in {}, output variable: {:?}\nLHS:", if is_question_mark_in_lhs { "LHS" } else { "RHS" }, output_variable).unwrap();
+                        for node in &lhs { writeln!(&mut output, "{}", node).unwrap(); }
+                        writeln!(&mut output, "RHS:").unwrap();
+                        for node in &rhs { writeln!(&mut output, "{}", node).unwrap(); }
+                        writeln!(&mut output).unwrap();
                     }
                 }
                 Err(e) => {
-                    writeln_or_err!(&mut output, "Error while parsing: {} at {}..{}", e.error, e.start, e.end);
-                    return Ok(output);
+                    writeln!(&mut output, "Error while parsing: {} at", e.error).unwrap();
+                    for range in e.ranges {
+                        writeln!(&mut output, "\t{range:?}").unwrap();
+                    }
+
+                    return output;
                 }
             }
         }
 
-        Ok(output)
+        output + &format!("\nEnvironment:\n{}", self.env().get_debug_info())
     }
 }
